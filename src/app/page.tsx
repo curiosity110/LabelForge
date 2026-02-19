@@ -101,6 +101,11 @@ export default function Page() {
     setTemplateUrl(file ? URL.createObjectURL(file) : null);
   }
 
+  function onImagesZipChange(file: File | null) {
+    setError(null);
+    setImagesZipFile(file);
+  }
+
   async function onCsvChange(file: File | null) {
     setError(null);
     setCsvFile(file);
@@ -358,7 +363,7 @@ export default function Page() {
               className="mt-1 block w-full text-sm"
               type="file"
               accept=".zip,application/zip"
-              onChange={(event) => setImagesZipFile(event.target.files?.[0] ?? null)}
+              onChange={(event) => onImagesZipChange(event.target.files?.[0] ?? null)}
             />
           </label>
 
@@ -366,7 +371,10 @@ export default function Page() {
             Image filename column
             <select
               value={imageColumn}
-              onChange={(event) => setImageColumn(event.target.value)}
+              onChange={(event) => {
+                setError(null);
+                setImageColumn(event.target.value);
+              }}
               className="mt-1 block w-full rounded border px-2 py-1 text-sm"
             >
               <option value="image_file">image_file</option>
@@ -465,7 +473,7 @@ export default function Page() {
           <button className="rounded border px-2 py-1 text-xs" type="button" onClick={() => distribute("horizontal")}>Distribute Horizontal</button>
         </div>
         {!templateUrl ? (
-          <p className="text-sm text-neutral-500">Upload a PNG template to place zones.</p>
+          <p className="text-sm text-neutral-500">Upload a PNG template to place zones. You can still generate using Images ZIP without a template preview.</p>
         ) : (
           <div className="relative inline-block max-w-full border">
             <img src={templateUrl} alt="Template" className="block max-w-full" />
