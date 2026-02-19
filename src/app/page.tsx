@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import Papa from "papaparse";
 import { Rnd } from "react-rnd";
 
@@ -25,17 +25,28 @@ const DEFAULT_ZONE: Omit<Zone, "id" | "name"> = {
   h: 80,
   fontSize: 28,
   align: "left",
-  color: "#111111",
+  color: "#2563eb",
 };
+
+const ZONE_COLORS = ["#2563eb", "#16a34a", "#ea580c", "#7c3aed", "#dc2626"];
+const GRID_SIZE = 10;
+const MAX_ZONES = 10;
+const AUTO_CREATE_COUNT = 6;
 
 function newZone(index: number): Zone {
   return {
     id: crypto.randomUUID(),
     name: `Zone ${index + 1}`,
     ...DEFAULT_ZONE,
+    color: ZONE_COLORS[index % ZONE_COLORS.length],
     x: DEFAULT_ZONE.x + index * 12,
     y: DEFAULT_ZONE.y + index * 12,
   };
+}
+
+function snap(value: number, enabled: boolean) {
+  if (!enabled) return value;
+  return Math.round(value / GRID_SIZE) * GRID_SIZE;
 }
 
 export default function Page() {
@@ -48,6 +59,9 @@ export default function Page() {
 
   const [zones, setZones] = useState<Zone[]>([newZone(0)]);
   const [mapping, setMapping] = useState<Record<string, string>>({});
+  const [selectedZoneId, setSelectedZoneId] = useState<string | null>(null);
+  const [snapToGrid, setSnapToGrid] = useState(true);
+  const overlayRef = useRef<HTMLDivElement | null>(null);
 
   const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState<"preview" | "generate" | null>(null);
@@ -69,6 +83,8 @@ export default function Page() {
     setPreviewRows([]);
     setZones([newZone(0)]);
     setMapping({});
+    setSelectedZoneId(null);
+    setSnapToGrid(true);
     setPreviewImageUrl(null);
     setLoading(null);
     setError(null);
@@ -106,9 +122,10 @@ export default function Page() {
 
     setMapping((current) => {
       const next = { ...current };
-      for (const zone of zones) {
-        if (!next[zone.id] && csvHeaders.length > 0) {
-          next[zone.id] = csvHeaders[0];
+      for (let index = 0; index < zones.length; index += 1) {
+        const zone = zones[index];
+        if (!next[zone.id] && csvHeaders[index]) {
+          next[zone.id] = csvHeaders[index];
         }
       }
       return next;
@@ -117,13 +134,32 @@ export default function Page() {
 
   function addZone() {
     setZones((prev) => {
-      const zone = newZone(prev.length);
+      if (prev.length >= MAX_ZONES) return prev;
+      const zoneIndex = prev.length;
+      const zone = newZone(zoneIndex);
+      const mappedHeader = headers[zoneIndex];
+      zone.name = mappedHeader ?? `Zone ${zoneIndex + 1}`;
       setMapping((current) => ({
         ...current,
-        [zone.id]: headers[0] ?? "",
+        [zone.id]: mappedHeader ?? "",
       }));
+      setSelectedZoneId(zone.id);
       return [...prev, zone];
     });
+  }
+
+  function autoCreateZonesFromHeaders() {
+    if (headers.length === 0) return;
+    const count = Math.min(headers.length, AUTO_CREATE_COUNT, MAX_ZONES);
+    const nextZones = headers.slice(0, count).map((header, index) => {
+      const zone = newZone(index);
+      zone.name = header;
+      return zone;
+    });
+    const nextMapping = Object.fromEntries(nextZones.map((zone, index) => [zone.id, headers[index] ?? ""]));
+    setZones(nextZones);
+    setMapping(nextMapping);
+    setSelectedZoneId(nextZones[0]?.id ?? null);
   }
 
   function removeZone(id: string) {
@@ -133,10 +169,67 @@ export default function Page() {
       delete copy[id];
       return copy;
     });
+    setSelectedZoneId((current) => (current === id ? null : current));
   }
 
   function updateZone(id: string, patch: Partial<Zone>) {
     setZones((prev) => prev.map((zone) => (zone.id === id ? { ...zone, ...patch } : zone)));
+  }
+
+  function getOverlayBounds() {
+    const node = overlayRef.current;
+    return {
+      width: node?.offsetWidth ?? 0,
+      height: node?.offsetHeight ?? 0,
+    };
+  }
+
+  function updateManyZones(ids: string[], updater: (zone: Zone) => Partial<Zone>) {
+    if (ids.length === 0) return;
+    setZones((prev) => prev.map((zone) => (ids.includes(zone.id) ? { ...zone, ...updater(zone) } : zone)));
+  }
+
+  function alignZones(mode: "left" | "centerX" | "right" | "top" | "centerY" | "bottom") {
+    const ids = selectedZoneId ? [selectedZoneId] : zones.map((zone) => zone.id);
+    const { width, height } = getOverlayBounds();
+    updateManyZones(ids, (zone) => {
+      if (mode === "left") return { x: 0 };
+      if (mode === "centerX") return { x: Math.max(0, (width - zone.w) / 2) };
+      if (mode === "right") return { x: Math.max(0, width - zone.w) };
+      if (mode === "top") return { y: 0 };
+      if (mode === "centerY") return { y: Math.max(0, (height - zone.h) / 2) };
+      return { y: Math.max(0, height - zone.h) };
+    });
+  }
+
+  function stackZones(direction: "vertical" | "horizontal") {
+    if (zones.length === 0) return;
+    const sorted = [...zones].sort((a, b) => (direction === "vertical" ? a.y - b.y : a.x - b.x));
+    let cursor = 0;
+    const updates: Record<string, Partial<Zone>> = {};
+    for (const zone of sorted) {
+      updates[zone.id] = direction === "vertical" ? { x: 0, y: cursor } : { y: 0, x: cursor };
+      cursor += (direction === "vertical" ? zone.h : zone.w) + 12;
+    }
+    setZones((prev) => prev.map((zone) => (updates[zone.id] ? { ...zone, ...updates[zone.id] } : zone)));
+  }
+
+  function distribute(direction: "vertical" | "horizontal") {
+    if (zones.length < 3) return;
+    const sorted = [...zones].sort((a, b) => (direction === "vertical" ? a.y - b.y : a.x - b.x));
+    const first = sorted[0];
+    const last = sorted[sorted.length - 1];
+    const start = direction === "vertical" ? first.y : first.x;
+    const endEdge = direction === "vertical" ? last.y + last.h : last.x + last.w;
+    const totalSize = sorted.reduce((sum, zone) => sum + (direction === "vertical" ? zone.h : zone.w), 0);
+    const gap = (endEdge - start - totalSize) / (sorted.length - 1);
+    let cursor = start;
+    const updates: Record<string, Partial<Zone>> = {};
+    for (const zone of sorted) {
+      updates[zone.id] = direction === "vertical" ? { y: cursor } : { x: cursor };
+      cursor += (direction === "vertical" ? zone.h : zone.w) + gap;
+    }
+    setZones((prev) => prev.map((zone) => (updates[zone.id] ? { ...zone, ...updates[zone.id] } : zone)));
   }
 
   async function callApi(path: "/api/preview" | "/api/generate") {
@@ -248,6 +341,18 @@ export default function Page() {
               Add Zone
             </button>
             <button
+              className="rounded border px-3 py-2 text-sm disabled:opacity-50"
+              onClick={autoCreateZonesFromHeaders}
+              type="button"
+              disabled={headers.length === 0}
+            >
+              Auto-create zones from CSV headers
+            </button>
+            <label className="flex items-center gap-2 rounded border px-3 py-2 text-sm">
+              <input type="checkbox" checked={snapToGrid} onChange={(event) => setSnapToGrid(event.target.checked)} />
+              Snap to grid (10px)
+            </label>
+            <button
               className="rounded bg-black px-3 py-2 text-sm text-white disabled:opacity-50"
               onClick={() => {
                 void previewFirstRow();
@@ -305,30 +410,65 @@ export default function Page() {
 
       <section className="space-y-3 rounded border p-4">
         <h2 className="font-medium">Template + Zones</h2>
+        <div className="flex flex-wrap gap-2">
+          <button className="rounded border px-2 py-1 text-xs" type="button" onClick={() => stackZones("vertical")}>Stack Vertical</button>
+          <button className="rounded border px-2 py-1 text-xs" type="button" onClick={() => stackZones("horizontal")}>Stack Horizontal</button>
+          <button className="rounded border px-2 py-1 text-xs" type="button" onClick={() => alignZones("left")}>Align Left</button>
+          <button className="rounded border px-2 py-1 text-xs" type="button" onClick={() => alignZones("centerX")}>Align Center X</button>
+          <button className="rounded border px-2 py-1 text-xs" type="button" onClick={() => alignZones("right")}>Align Right</button>
+          <button className="rounded border px-2 py-1 text-xs" type="button" onClick={() => alignZones("top")}>Align Top</button>
+          <button className="rounded border px-2 py-1 text-xs" type="button" onClick={() => alignZones("centerY")}>Align Center Y</button>
+          <button className="rounded border px-2 py-1 text-xs" type="button" onClick={() => alignZones("bottom")}>Align Bottom</button>
+          <button className="rounded border px-2 py-1 text-xs" type="button" onClick={() => distribute("vertical")}>Distribute Vertical</button>
+          <button className="rounded border px-2 py-1 text-xs" type="button" onClick={() => distribute("horizontal")}>Distribute Horizontal</button>
+        </div>
         {!templateUrl ? (
           <p className="text-sm text-neutral-500">Upload a PNG template to place zones.</p>
         ) : (
           <div className="relative inline-block max-w-full border">
             <img src={templateUrl} alt="Template" className="block max-w-full" />
-            <div className="pointer-events-none absolute inset-0">
+            <div ref={overlayRef} className="pointer-events-none absolute inset-0">
               {zones.map((zone) => (
                 <Rnd
                   key={zone.id}
                   bounds="parent"
                   size={{ width: zone.w, height: zone.h }}
                   position={{ x: zone.x, y: zone.y }}
-                  onDragStop={(_, data) => updateZone(zone.id, { x: data.x, y: data.y })}
-                  onResizeStop={(_, __, ref, ___, pos) => {
+                  dragGrid={snapToGrid ? [GRID_SIZE, GRID_SIZE] : undefined}
+                  resizeGrid={snapToGrid ? [GRID_SIZE, GRID_SIZE] : undefined}
+                  onDragStart={() => setSelectedZoneId(zone.id)}
+                  onDragStop={(_, data) =>
                     updateZone(zone.id, {
-                      x: pos.x,
-                      y: pos.y,
-                      w: ref.offsetWidth,
-                      h: ref.offsetHeight,
+                      x: snap(data.x, snapToGrid),
+                      y: snap(data.y, snapToGrid),
+                    })
+                  }
+                  onResizeStop={(_, __, ref, ___, pos) => {
+                    setSelectedZoneId(zone.id);
+                    updateZone(zone.id, {
+                      x: snap(pos.x, snapToGrid),
+                      y: snap(pos.y, snapToGrid),
+                      w: snap(ref.offsetWidth, snapToGrid),
+                      h: snap(ref.offsetHeight, snapToGrid),
                     });
                   }}
-                  style={{ border: "2px dashed #2563eb", background: "rgba(37,99,235,0.08)", pointerEvents: "auto" }}
+                  onClick={() => setSelectedZoneId(zone.id)}
+                  style={{
+                    border: selectedZoneId === zone.id ? `3px solid ${zone.color}` : `2px solid ${zone.color}`,
+                    background: "rgba(255,255,255,0.12)",
+                    boxShadow: selectedZoneId === zone.id ? "0 0 0 2px rgba(255,255,255,0.7), 0 4px 12px rgba(0,0,0,0.2)" : "none",
+                    pointerEvents: "auto",
+                  }}
                 >
-                  <div className="flex h-full w-full items-center justify-center text-xs font-medium text-blue-800">{zone.name}</div>
+                  <div className="relative h-full w-full">
+                    <div className="h-5 w-full" style={{ backgroundColor: zone.color }} />
+                    <div
+                      className="absolute left-1 top-1 rounded px-2 py-0.5 text-[10px] font-semibold text-white"
+                      style={{ backgroundColor: zone.color }}
+                    >
+                      {zone.name}
+                    </div>
+                  </div>
                 </Rnd>
               ))}
             </div>
@@ -382,7 +522,7 @@ export default function Page() {
                 value={zone.color}
                 onChange={(event) => updateZone(zone.id, { color: event.target.value })}
                 className="h-9 w-12 rounded border"
-                title="Text color"
+                title="Zone overlay color"
               />
               <div className="text-xs text-neutral-500 md:col-span-5">Zone {index + 1}</div>
             </div>
