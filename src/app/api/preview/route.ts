@@ -1,7 +1,7 @@
-import { inflateRawSync } from "node:zlib";
 import { NextResponse } from "next/server";
 import Papa from "papaparse";
 import sharp from "sharp";
+import { normalizeImageFileName, parseImagesZip } from "@/lib/images-zip";
 
 export const runtime = "nodejs";
 
@@ -9,8 +9,6 @@ const MAX_ROWS = 50;
 const MAX_TEMPLATE_SIZE_BYTES = 5 * 1024 * 1024;
 const MAX_CSV_SIZE_BYTES = 2 * 1024 * 1024;
 const MAX_IMAGES_ZIP_SIZE_BYTES = 50 * 1024 * 1024;
-
-const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg"]);
 
 type Zone = {
   id: string;
@@ -24,14 +22,6 @@ type Zone = {
 };
 
 type Mapping = Record<string, string>;
-
-type ZipEntry = {
-  fileName: string;
-  compressedSize: number;
-  uncompressedSize: number;
-  compressionMethod: number;
-  localHeaderOffset: number;
-};
 
 function escapeXml(value: string): string {
   return value
@@ -121,110 +111,6 @@ function buildOverlaySvg(width: number, height: number, zones: Zone[], mapping: 
   return `<?xml version="1.0" encoding="UTF-8"?><svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">${blocks}</svg>`;
 }
 
-function getBaseName(filePath: string): string {
-  return filePath.split("/").pop() ?? filePath;
-}
-
-function readUint32(buffer: Buffer, offset: number): number {
-  return buffer.readUInt32LE(offset);
-}
-
-function readUint16(buffer: Buffer, offset: number): number {
-  return buffer.readUInt16LE(offset);
-}
-
-function parseZipEntries(buffer: Buffer): ZipEntry[] {
-  const eocdSignature = 0x06054b50;
-  const cdSignature = 0x02014b50;
-  let eocdOffset = -1;
-
-  for (let i = buffer.length - 22; i >= Math.max(0, buffer.length - 22 - 65535); i -= 1) {
-    if (readUint32(buffer, i) === eocdSignature) {
-      eocdOffset = i;
-      break;
-    }
-  }
-
-  if (eocdOffset === -1) {
-    throw new Error("Invalid ZIP: end of central directory not found.");
-  }
-
-  const centralDirectorySize = readUint32(buffer, eocdOffset + 12);
-  const centralDirectoryOffset = readUint32(buffer, eocdOffset + 16);
-  const entries: ZipEntry[] = [];
-
-  let offset = centralDirectoryOffset;
-  const end = centralDirectoryOffset + centralDirectorySize;
-
-  while (offset < end) {
-    if (readUint32(buffer, offset) !== cdSignature) {
-      throw new Error("Invalid ZIP: malformed central directory entry.");
-    }
-
-    const compressionMethod = readUint16(buffer, offset + 10);
-    const compressedSize = readUint32(buffer, offset + 20);
-    const uncompressedSize = readUint32(buffer, offset + 24);
-    const fileNameLength = readUint16(buffer, offset + 28);
-    const extraLength = readUint16(buffer, offset + 30);
-    const commentLength = readUint16(buffer, offset + 32);
-    const localHeaderOffset = readUint32(buffer, offset + 42);
-    const fileName = buffer.toString("utf8", offset + 46, offset + 46 + fileNameLength);
-
-    entries.push({
-      fileName,
-      compressedSize,
-      uncompressedSize,
-      compressionMethod,
-      localHeaderOffset,
-    });
-
-    offset += 46 + fileNameLength + extraLength + commentLength;
-  }
-
-  return entries;
-}
-
-function extractEntryBuffer(zipBuffer: Buffer, entry: ZipEntry): Buffer {
-  const localSignature = 0x04034b50;
-  if (readUint32(zipBuffer, entry.localHeaderOffset) !== localSignature) {
-    throw new Error(`Invalid ZIP: missing local header for ${entry.fileName}.`);
-  }
-
-  const fileNameLength = readUint16(zipBuffer, entry.localHeaderOffset + 26);
-  const extraLength = readUint16(zipBuffer, entry.localHeaderOffset + 28);
-  const dataStart = entry.localHeaderOffset + 30 + fileNameLength + extraLength;
-  const compressedData = zipBuffer.subarray(dataStart, dataStart + entry.compressedSize);
-
-  if (entry.compressionMethod === 0) {
-    return Buffer.from(compressedData);
-  }
-  if (entry.compressionMethod === 8) {
-    return inflateRawSync(compressedData);
-  }
-
-  throw new Error(`Unsupported ZIP compression method for ${entry.fileName}.`);
-}
-
-function parseImagesZip(zipBuffer: Buffer): Map<string, Buffer> {
-  const images = new Map<string, Buffer>();
-  const entries = parseZipEntries(zipBuffer);
-
-  for (const entry of entries) {
-    if (entry.fileName.endsWith("/")) continue;
-    const baseName = getBaseName(entry.fileName);
-    const ext = baseName.slice(baseName.lastIndexOf(".")).toLowerCase();
-    if (!IMAGE_EXTENSIONS.has(ext)) continue;
-    const fileBuffer = extractEntryBuffer(zipBuffer, entry);
-    images.set(baseName, fileBuffer);
-  }
-
-  if (images.size === 0) {
-    throw new Error("Images ZIP did not contain any .png/.jpg/.jpeg files.");
-  }
-
-  return images;
-}
-
 export async function POST(request: Request) {
   const form = await request.formData();
 
@@ -294,13 +180,13 @@ export async function POST(request: Request) {
   let backgroundBuffer: Buffer;
 
   if (imagesZip instanceof File) {
-    const imageMap = parseImagesZip(Buffer.from(await imagesZip.arrayBuffer()));
+    const imageMap = await parseImagesZip(Buffer.from(await imagesZip.arrayBuffer()));
     const imageFileName = String(firstRow[imageColumn] ?? "").trim();
     if (!imageFileName) {
       return NextResponse.json({ error: `Row 1 is missing image filename in column "${imageColumn}".` }, { status: 400 });
     }
 
-    const imageFromZip = imageMap.get(getBaseName(imageFileName));
+    const imageFromZip = imageMap.get(normalizeImageFileName(imageFileName));
     if (!imageFromZip) {
       return NextResponse.json({ error: `Missing image "${imageFileName}" in uploaded ZIP.` }, { status: 400 });
     }
