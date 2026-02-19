@@ -4,6 +4,9 @@ import { useMemo, useRef, useState } from "react";
 import Papa from "papaparse";
 import { Rnd } from "react-rnd";
 
+type SourceMode = "template" | "zip";
+type ZipAssignMode = "filename" | "rowOrder";
+
 type Zone = {
   id: string;
   name: string;
@@ -14,6 +17,9 @@ type Zone = {
   fontSize: number;
   align: "left" | "center" | "right";
   color: string;
+  editorBgEnabled: boolean;
+  editorBgColor: string;
+  editorBgOpacity: number;
 };
 
 type CsvRow = Record<string, string>;
@@ -26,6 +32,9 @@ const DEFAULT_ZONE: Omit<Zone, "id" | "name"> = {
   fontSize: 28,
   align: "left",
   color: "#2563eb",
+  editorBgEnabled: true,
+  editorBgColor: "#ffffff",
+  editorBgOpacity: 0.85,
 };
 
 const ZONE_COLORS = ["#2563eb", "#16a34a", "#ea580c", "#7c3aed", "#dc2626"];
@@ -49,7 +58,20 @@ function snap(value: number, enabled: boolean) {
   return Math.round(value / GRID_SIZE) * GRID_SIZE;
 }
 
+function toRgba(hex: string, opacity: number): string {
+  const normalized = hex.replace("#", "");
+  const chunk = normalized.length === 3 ? normalized.split("").map((c) => `${c}${c}`).join("") : normalized;
+  if (chunk.length !== 6) return `rgba(255,255,255,${opacity})`;
+  const r = Number.parseInt(chunk.slice(0, 2), 16);
+  const g = Number.parseInt(chunk.slice(2, 4), 16);
+  const b = Number.parseInt(chunk.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${Math.max(0, Math.min(1, opacity))})`;
+}
+
 export default function Page() {
+  const [sourceMode, setSourceMode] = useState<SourceMode>("template");
+  const [zipAssignMode, setZipAssignMode] = useState<ZipAssignMode>("filename");
+
   const [templateFile, setTemplateFile] = useState<File | null>(null);
   const [templateUrl, setTemplateUrl] = useState<string | null>(null);
   const [imagesZipFile, setImagesZipFile] = useState<File | null>(null);
@@ -58,6 +80,7 @@ export default function Page() {
   const [headers, setHeaders] = useState<string[]>([]);
   const [previewRows, setPreviewRows] = useState<CsvRow[]>([]);
   const [imageColumn, setImageColumn] = useState("image_file");
+  const [showRow1Values, setShowRow1Values] = useState(false);
 
   const [zones, setZones] = useState<Zone[]>([newZone(0)]);
   const [mapping, setMapping] = useState<Record<string, string>>({});
@@ -70,14 +93,28 @@ export default function Page() {
   const [error, setError] = useState<string | null>(null);
 
   const readyForRender = useMemo(() => {
-    if ((!templateFile && !imagesZipFile) || !csvFile || zones.length === 0) return false;
+    const hasSource = sourceMode === "template" ? Boolean(templateFile) : Boolean(imagesZipFile);
+    if (!hasSource || !csvFile || zones.length === 0) return false;
+    if (sourceMode === "zip" && zipAssignMode === "filename" && !imageColumn) return false;
     return zones.every((zone) => Boolean(mapping[zone.id]));
-  }, [templateFile, imagesZipFile, csvFile, zones, mapping]);
+  }, [csvFile, imageColumn, imagesZipFile, mapping, sourceMode, templateFile, zipAssignMode, zones]);
+
+  const rowOne = previewRows[0];
+
+  function zoneText(zone: Zone): string {
+    const mappedColumn = mapping[zone.id];
+    if (showRow1Values && rowOne && mappedColumn) {
+      return String(rowOne[mappedColumn] ?? "");
+    }
+    return mappedColumn ? `{{${zone.name || mappedColumn}}}` : "{{unmapped}}";
+  }
 
   function resetAll() {
     if (templateUrl) URL.revokeObjectURL(templateUrl);
     if (previewImageUrl) URL.revokeObjectURL(previewImageUrl);
 
+    setSourceMode("template");
+    setZipAssignMode("filename");
     setTemplateFile(null);
     setTemplateUrl(null);
     setCsvFile(null);
@@ -85,6 +122,7 @@ export default function Page() {
     setHeaders([]);
     setPreviewRows([]);
     setImageColumn("image_file");
+    setShowRow1Values(false);
     setZones([newZone(0)]);
     setMapping({});
     setSelectedZoneId(null);
@@ -109,9 +147,6 @@ export default function Page() {
   async function onCsvChange(file: File | null) {
     setError(null);
     setCsvFile(file);
-    setHeaders([]);
-    setPreviewRows([]);
-
     if (!file) return;
 
     const text = await file.text();
@@ -126,14 +161,15 @@ export default function Page() {
     }
 
     const csvHeaders = (parsed.meta.fields ?? []).filter(Boolean);
-    if (!csvHeaders.includes("image_file")) {
-      setError('CSV must include a column named "image_file".');
-      return;
-    }
-
     setHeaders(csvHeaders);
-    setImageColumn((current) => (csvHeaders.includes(current) ? current : "image_file"));
     setPreviewRows(parsed.data.slice(0, 5));
+    setShowRow1Values(parsed.data.length > 0);
+
+    setImageColumn((current) => {
+      if (csvHeaders.includes(current)) return current;
+      if (csvHeaders.includes("image_file")) return "image_file";
+      return csvHeaders[0] ?? "";
+    });
 
     setMapping((current) => {
       const next = { ...current };
@@ -248,20 +284,36 @@ export default function Page() {
   }
 
   async function callApi(path: "/api/preview" | "/api/generate") {
-    if (!csvFile || (!templateFile && !imagesZipFile)) {
-      setError("Please upload CSV and either template PNG or images ZIP.");
+    if (!csvFile) {
+      setError("Please upload CSV.");
+      return;
+    }
+    if (sourceMode === "template" && !templateFile) {
+      setError("Template mode requires a template PNG.");
+      return;
+    }
+    if (sourceMode === "zip" && !imagesZipFile) {
+      setError("Images ZIP mode requires an images ZIP upload.");
+      return;
+    }
+    if (sourceMode === "zip" && zipAssignMode === "filename" && !imageColumn) {
+      setError("Choose a CSV column for ZIP filename matching.");
       return;
     }
 
     const form = new FormData();
-    if (templateFile) {
+    if (sourceMode === "template" && templateFile) {
       form.append("template", templateFile);
     }
-    if (imagesZipFile) {
+    if (sourceMode === "zip" && imagesZipFile) {
       form.append("imagesZip", imagesZipFile);
     }
     form.append("csv", csvFile);
-    form.append("imageColumn", imageColumn);
+    form.append("sourceMode", sourceMode);
+    form.append("zipAssignMode", zipAssignMode);
+    if (sourceMode === "zip" && zipAssignMode === "filename" && imageColumn) {
+      form.append("imageColumn", imageColumn);
+    }
     form.append("zones", JSON.stringify(zones));
     form.append("mapping", JSON.stringify(mapping));
 
@@ -281,7 +333,7 @@ export default function Page() {
   async function previewFirstRow() {
     setError(null);
     if (!readyForRender) {
-      setError("Upload files and map all zones before previewing.");
+      setError("Upload required source files and map all zones before previewing.");
       return;
     }
 
@@ -302,7 +354,7 @@ export default function Page() {
   async function generateZip() {
     setError(null);
     if (!readyForRender) {
-      setError("Upload files and map all zones before generating ZIP.");
+      setError("Upload required source files and map all zones before generating ZIP.");
       return;
     }
 
@@ -335,6 +387,37 @@ export default function Page() {
       <section className="grid gap-4 md:grid-cols-2">
         <div className="space-y-3 rounded border p-4">
           <h2 className="font-medium">Inputs</h2>
+
+          <fieldset className="rounded border p-2 text-sm">
+            <legend className="px-1 text-xs font-medium">Source Mode</legend>
+            <div className="flex flex-wrap gap-3">
+              <label className="flex items-center gap-2">
+                <input
+                  type="radio"
+                  name="sourceMode"
+                  checked={sourceMode === "template"}
+                  onChange={() => {
+                    setSourceMode("template");
+                    setError(null);
+                  }}
+                />
+                Template PNG
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  type="radio"
+                  name="sourceMode"
+                  checked={sourceMode === "zip"}
+                  onChange={() => {
+                    setSourceMode("zip");
+                    setError(null);
+                  }}
+                />
+                Images ZIP
+              </label>
+            </div>
+          </fieldset>
+
           <label className="block text-sm">
             Template PNG
             <input
@@ -367,24 +450,45 @@ export default function Page() {
             />
           </label>
 
-          <label className="block text-sm">
-            Image filename column
-            <select
-              value={imageColumn}
-              onChange={(event) => {
-                setError(null);
-                setImageColumn(event.target.value);
-              }}
-              className="mt-1 block w-full rounded border px-2 py-1 text-sm"
-            >
-              <option value="image_file">image_file</option>
-              {headers.map((header) => (
-                <option key={header} value={header}>
-                  {header}
-                </option>
-              ))}
-            </select>
-          </label>
+          {sourceMode === "zip" && (
+            <>
+              <label className="block text-sm">
+                ZIP assignment mode
+                <select
+                  value={zipAssignMode}
+                  onChange={(event) => {
+                    setZipAssignMode(event.target.value as ZipAssignMode);
+                    setError(null);
+                  }}
+                  className="mt-1 block w-full rounded border px-2 py-1 text-sm"
+                >
+                  <option value="filename">Match by filename (CSV column)</option>
+                  <option value="rowOrder">Match by row order</option>
+                </select>
+              </label>
+
+              {zipAssignMode === "filename" && (
+                <label className="block text-sm">
+                  Image filename column
+                  <select
+                    value={imageColumn}
+                    onChange={(event) => {
+                      setError(null);
+                      setImageColumn(event.target.value);
+                    }}
+                    className="mt-1 block w-full rounded border px-2 py-1 text-sm"
+                  >
+                    {headers.length === 0 && <option value="">No CSV headers loaded</option>}
+                    {headers.map((header) => (
+                      <option key={header} value={header}>
+                        {header}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+            </>
+          )}
 
           <div className="flex flex-wrap gap-2">
             <button className="rounded border px-3 py-2 text-sm" onClick={addZone} type="button">
@@ -401,6 +505,15 @@ export default function Page() {
             <label className="flex items-center gap-2 rounded border px-3 py-2 text-sm">
               <input type="checkbox" checked={snapToGrid} onChange={(event) => setSnapToGrid(event.target.checked)} />
               Snap to grid (10px)
+            </label>
+            <label className="flex items-center gap-2 rounded border px-3 py-2 text-sm">
+              <input
+                type="checkbox"
+                checked={showRow1Values}
+                onChange={(event) => setShowRow1Values(event.target.checked)}
+                disabled={previewRows.length === 0}
+              />
+              Show Row 1 values in zones
             </label>
             <button
               className="rounded bg-black px-3 py-2 text-sm text-white disabled:opacity-50"
@@ -473,7 +586,7 @@ export default function Page() {
           <button className="rounded border px-2 py-1 text-xs" type="button" onClick={() => distribute("horizontal")}>Distribute Horizontal</button>
         </div>
         {!templateUrl ? (
-          <p className="text-sm text-neutral-500">Upload a PNG template to place zones. You can still generate using Images ZIP without a template preview.</p>
+          <p className="text-sm text-neutral-500">Upload a PNG template to place zones visually in the editor.</p>
         ) : (
           <div className="relative inline-block max-w-full border">
             <img src={templateUrl} alt="Template" className="block max-w-full" />
@@ -510,13 +623,25 @@ export default function Page() {
                     pointerEvents: "auto",
                   }}
                 >
-                  <div className="relative h-full w-full">
-                    <div className="h-5 w-full" style={{ backgroundColor: zone.color }} />
+                  <div className="relative flex h-full w-full flex-col overflow-hidden p-2">
                     <div
-                      className="absolute left-1 top-1 rounded px-2 py-0.5 text-[10px] font-semibold text-white"
+                      className="w-fit rounded px-2 py-0.5 text-[10px] font-semibold text-white"
                       style={{ backgroundColor: zone.color }}
                     >
                       {zone.name}
+                    </div>
+                    <div
+                      className="mt-1 rounded px-2 py-1 text-xs leading-snug text-neutral-900"
+                      style={{
+                        background: zone.editorBgEnabled ? toRgba(zone.editorBgColor, zone.editorBgOpacity) : "transparent",
+                        display: "-webkit-box",
+                        WebkitLineClamp: Math.max(2, Math.min(4, Math.floor(zone.h / 28) || 2)),
+                        WebkitBoxOrient: "vertical",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                      }}
+                    >
+                      {zoneText(zone)}
                     </div>
                   </div>
                 </Rnd>
@@ -574,6 +699,37 @@ export default function Page() {
                 className="h-9 w-12 rounded border"
                 title="Zone overlay color"
               />
+              <label className="flex items-center gap-2 text-xs md:col-span-2">
+                <input
+                  type="checkbox"
+                  checked={zone.editorBgEnabled}
+                  onChange={(event) => updateZone(zone.id, { editorBgEnabled: event.target.checked })}
+                />
+                Editor bg
+              </label>
+              <input
+                type="color"
+                value={zone.editorBgColor}
+                onChange={(event) => updateZone(zone.id, { editorBgColor: event.target.value })}
+                className="h-9 w-12 rounded border"
+                title="Editor background color"
+              />
+              <label className="flex items-center gap-2 text-xs">
+                Opacity
+                <input
+                  type="number"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={zone.editorBgOpacity}
+                  onChange={(event) =>
+                    updateZone(zone.id, {
+                      editorBgOpacity: Math.max(0, Math.min(1, Number(event.target.value) || 0)),
+                    })
+                  }
+                  className="w-16 rounded border px-1 py-0.5 text-xs"
+                />
+              </label>
               <div className="text-xs text-neutral-500 md:col-span-5">Zone {index + 1}</div>
             </div>
           ))}
