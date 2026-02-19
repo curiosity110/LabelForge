@@ -1,5 +1,3 @@
-import { PassThrough } from "stream";
-import archiver from "archiver";
 import { NextResponse } from "next/server";
 import Papa from "papaparse";
 import sharp from "sharp";
@@ -117,15 +115,6 @@ function buildOverlaySvg(
   return `<?xml version="1.0" encoding="UTF-8"?><svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">${blocks}</svg>`;
 }
 
-function streamToBuffer(stream: PassThrough): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    stream.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-    stream.on("end", () => resolve(Buffer.concat(chunks)));
-    stream.on("error", reject);
-  });
-}
-
 export async function POST(request: Request) {
   const form = await request.formData();
 
@@ -179,32 +168,16 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Template dimensions could not be read." }, { status: 400 });
   }
 
-  const zipStream = new PassThrough();
-  const archive = archiver("zip", { zlib: { level: 9 } });
-  archive.pipe(zipStream);
+  const svg = buildOverlaySvg(metadata.width, metadata.height, zones, mapping, rows[0]);
+  const output = await sharp(templateBuffer)
+    .composite([{ input: Buffer.from(svg), top: 0, left: 0 }])
+    .png()
+    .toBuffer();
 
-  for (let index = 0; index < rows.length; index += 1) {
-    const row = rows[index];
-    const svg = buildOverlaySvg(metadata.width, metadata.height, zones, mapping, row);
-    const image = await sharp(templateBuffer)
-      .composite([{ input: Buffer.from(svg), top: 0, left: 0 }])
-      .png()
-      .toBuffer();
-    const name = String(index + 1).padStart(4, "0");
-    archive.append(image, { name: `images/${name}.png` });
-  }
-
-  archive.append(Papa.unparse(rows), { name: "output.csv" });
-
-  const finalizePromise = archive.finalize();
-  const zipBuffer = await streamToBuffer(zipStream);
-  await finalizePromise;
-
-  return new NextResponse(new Uint8Array(zipBuffer), {
+  return new NextResponse(new Uint8Array(output), {
     status: 200,
     headers: {
-      "Content-Type": "application/zip",
-      "Content-Disposition": 'attachment; filename="labelforge.zip"',
+      "Content-Type": "image/png",
       "Cache-Control": "no-store",
     },
   });

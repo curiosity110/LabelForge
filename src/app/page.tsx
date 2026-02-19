@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import Papa from "papaparse";
 import { Rnd } from "react-rnd";
 
@@ -14,98 +14,101 @@ type Zone = {
   fontSize: number;
   align: "left" | "center" | "right";
   color: string;
-  bgEnabled?: boolean;
-  bgColor?: string;
-  padding?: number;
 };
 
-function uid() {
-  return Math.random().toString(36).slice(2, 10);
+type CsvRow = Record<string, string>;
+
+const DEFAULT_ZONE: Omit<Zone, "id" | "name"> = {
+  x: 20,
+  y: 20,
+  w: 220,
+  h: 80,
+  fontSize: 28,
+  align: "left",
+  color: "#111111",
+};
+
+function newZone(index: number): Zone {
+  return {
+    id: crypto.randomUUID(),
+    name: `Zone ${index + 1}`,
+    ...DEFAULT_ZONE,
+    x: DEFAULT_ZONE.x + index * 12,
+    y: DEFAULT_ZONE.y + index * 12,
+  };
 }
 
-export default function HomePage() {
+export default function Page() {
   const [templateFile, setTemplateFile] = useState<File | null>(null);
   const [templateUrl, setTemplateUrl] = useState<string | null>(null);
 
   const [csvFile, setCsvFile] = useState<File | null>(null);
-  const [csvHeaders, setCsvHeaders] = useState<string[]>([]);
-  const [csvPreview, setCsvPreview] = useState<Record<string, any>[]>([]);
+  const [headers, setHeaders] = useState<string[]>([]);
+  const [previewRows, setPreviewRows] = useState<CsvRow[]>([]);
 
-  const [zones, setZones] = useState<Zone[]>([
-    {
-      id: uid(),
-      name: "Title",
-      x: 40,
-      y: 40,
-      w: 500,
-      h: 120,
-      fontSize: 48,
-      align: "left",
-      color: "#000000",
-      bgEnabled: true,
-      bgColor: "rgba(255,255,255,0.85)",
-      padding: 10,
-    },
-  ]);
-
+  const [zones, setZones] = useState<Zone[]>([newZone(0)]);
   const [mapping, setMapping] = useState<Record<string, string>>({});
-  const [activeZoneId, setActiveZoneId] = useState<string | null>(zones[0]?.id ?? null);
 
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState<"preview" | "generate" | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  const imgRef = useRef<HTMLImageElement | null>(null);
-  const [imgNatural, setImgNatural] = useState<{ w: number; h: number } | null>(null);
-  const [imgDisplay, setImgDisplay] = useState<{ w: number; h: number } | null>(null);
+  const readyForRender = useMemo(() => {
+    if (!templateFile || !csvFile || zones.length === 0) return false;
+    return zones.every((zone) => Boolean(mapping[zone.id]));
+  }, [templateFile, csvFile, zones, mapping]);
 
-  const activeZone = useMemo(
-    () => zones.find((z) => z.id === activeZoneId) ?? null,
-    [zones, activeZoneId]
-  );
-
-  function onTemplatePicked(f: File | null) {
-    setErr(null);
-    setTemplateFile(f);
-    setImgNatural(null);
-    setImgDisplay(null);
+  function resetAll() {
     if (templateUrl) URL.revokeObjectURL(templateUrl);
-    setTemplateUrl(f ? URL.createObjectURL(f) : null);
+    if (previewImageUrl) URL.revokeObjectURL(previewImageUrl);
+
+    setTemplateFile(null);
+    setTemplateUrl(null);
+    setCsvFile(null);
+    setHeaders([]);
+    setPreviewRows([]);
+    setZones([newZone(0)]);
+    setMapping({});
+    setPreviewImageUrl(null);
+    setLoading(null);
+    setError(null);
   }
 
-  async function onCsvPicked(f: File | null) {
-    setErr(null);
-    setCsvFile(f);
-    setCsvHeaders([]);
-    setCsvPreview([]);
-    if (!f) return;
+  function onTemplateChange(file: File | null) {
+    setError(null);
+    if (templateUrl) URL.revokeObjectURL(templateUrl);
+    setTemplateFile(file);
+    setTemplateUrl(file ? URL.createObjectURL(file) : null);
+  }
 
-    const text = await f.text();
-    const parsed = Papa.parse<Record<string, any>>(text, {
+  async function onCsvChange(file: File | null) {
+    setError(null);
+    setCsvFile(file);
+    setHeaders([]);
+    setPreviewRows([]);
+
+    if (!file) return;
+
+    const text = await file.text();
+    const parsed = Papa.parse<CsvRow>(text, {
       header: true,
       skipEmptyLines: true,
     });
 
-    if (parsed.errors?.length) {
-      setErr("CSV parse error. Check formatting and headers.");
+    if (parsed.errors.length > 0) {
+      setError(parsed.errors[0]?.message ?? "Failed to parse CSV.");
       return;
     }
 
-    const headers = (parsed.meta.fields ?? []).filter(Boolean) as string[];
-    setCsvHeaders(headers);
+    const csvHeaders = (parsed.meta.fields ?? []).filter(Boolean);
+    setHeaders(csvHeaders);
+    setPreviewRows(parsed.data.slice(0, 5));
 
-    const preview = (parsed.data ?? []).slice(0, 8);
-    setCsvPreview(preview);
-
-    // auto-map by name (best effort)
-    setMapping((prev) => {
-      const next = { ...prev };
-      for (const z of zones) {
-        if (!next[z.id]) {
-          const found =
-            headers.find((h) => h.toLowerCase() === z.name.toLowerCase()) ||
-            headers.find((h) => h.toLowerCase().includes(z.name.toLowerCase())) ||
-            "";
-          if (found) next[z.id] = found;
+    setMapping((current) => {
+      const next = { ...current };
+      for (const zone of zones) {
+        if (!next[zone.id] && csvHeaders.length > 0) {
+          next[zone.id] = csvHeaders[0];
         }
       }
       return next;
@@ -113,453 +116,286 @@ export default function HomePage() {
   }
 
   function addZone() {
-    const z: Zone = {
-      id: uid(),
-      name: `Zone ${zones.length + 1}`,
-      x: 60,
-      y: 200 + zones.length * 40,
-      w: 500,
-      h: 120,
-      fontSize: 28,
-      align: "left",
-      color: "#000000",
-      bgEnabled: false,
-      bgColor: "rgba(255,255,255,0.85)",
-      padding: 10,
-    };
-    setZones((zs) => [...zs, z]);
-    setActiveZoneId(z.id);
+    setZones((prev) => {
+      const zone = newZone(prev.length);
+      setMapping((current) => ({
+        ...current,
+        [zone.id]: headers[0] ?? "",
+      }));
+      return [...prev, zone];
+    });
   }
 
-  function removeActiveZone() {
-    if (!activeZoneId) return;
-    setZones((zs) => zs.filter((z) => z.id !== activeZoneId));
-    setMapping((m) => {
-      const copy = { ...m };
-      delete copy[activeZoneId];
+  function removeZone(id: string) {
+    setZones((prev) => prev.filter((zone) => zone.id !== id));
+    setMapping((prev) => {
+      const copy = { ...prev };
+      delete copy[id];
       return copy;
-    });
-    setActiveZoneId((prev) => {
-      const remaining = zones.filter((z) => z.id !== prev);
-      return remaining[0]?.id ?? null;
     });
   }
 
   function updateZone(id: string, patch: Partial<Zone>) {
-    setZones((zs) => zs.map((z) => (z.id === id ? { ...z, ...patch } : z)));
+    setZones((prev) => prev.map((zone) => (zone.id === id ? { ...zone, ...patch } : zone)));
   }
 
-  function imgToNaturalCoords(x: number, y: number) {
-    // Convert from displayed image coordinates to natural coordinates
-    if (!imgNatural || !imgDisplay) return { x, y };
-    const sx = imgNatural.w / imgDisplay.w;
-    const sy = imgNatural.h / imgDisplay.h;
-    return { x: Math.round(x * sx), y: Math.round(y * sy) };
+  async function callApi(path: "/api/preview" | "/api/generate") {
+    if (!templateFile || !csvFile) {
+      setError("Please upload both template PNG and CSV.");
+      return;
+    }
+
+    const form = new FormData();
+    form.append("template", templateFile);
+    form.append("csv", csvFile);
+    form.append("zones", JSON.stringify(zones));
+    form.append("mapping", JSON.stringify(mapping));
+
+    const response = await fetch(path, {
+      method: "POST",
+      body: form,
+    });
+
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(payload?.error ?? `${path} failed`);
+    }
+
+    return response;
   }
 
-  function naturalToImgCoords(x: number, y: number) {
-    if (!imgNatural || !imgDisplay) return { x, y };
-    const sx = imgDisplay.w / imgNatural.w;
-    const sy = imgDisplay.h / imgNatural.h;
-    return { x: x * sx, y: y * sy };
+  async function previewFirstRow() {
+    setError(null);
+    if (!readyForRender) {
+      setError("Upload files and map all zones before previewing.");
+      return;
+    }
+
+    setLoading("preview");
+    try {
+      const response = await callApi("/api/preview");
+      if (!response) return;
+      const blob = await response.blob();
+      if (previewImageUrl) URL.revokeObjectURL(previewImageUrl);
+      setPreviewImageUrl(URL.createObjectURL(blob));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Preview failed.");
+    } finally {
+      setLoading(null);
+    }
   }
 
   async function generateZip() {
-    setErr(null);
-    if (!templateFile) return setErr("Upload a template PNG first.");
-    if (!csvFile) return setErr("Upload a CSV file first.");
-    if (!zones.length) return setErr("Add at least one zone.");
-
-    // Require mapping for each zone
-    for (const z of zones) {
-      if (!mapping[z.id]) return setErr(`Map a CSV column for zone: "${z.name}"`);
+    setError(null);
+    if (!readyForRender) {
+      setError("Upload files and map all zones before generating ZIP.");
+      return;
     }
 
-    // Ensure we have natural image size so we send correct coordinates to backend
-    if (!imgNatural || !imgDisplay) {
-      return setErr("Template image not loaded yet. Try again in a second.");
-    }
-
-    setBusy(true);
+    setLoading("generate");
     try {
-      // Convert zones from display coords to natural coords for correct rendering
-      if (!imgNatural || !imgDisplay) {
-        return setErr("Template image not loaded yet. Try again in a second.");
-      }
-
-      // Convert DISPLAY coords -> NATURAL coords ONCE, correctly
-      const sx = imgNatural.w / imgDisplay.w;
-      const sy = imgNatural.h / imgDisplay.h;
-
-      const zonesNatural = zones.map((z) => ({
-        ...z,
-        x: Math.round(z.x * sx),
-        y: Math.round(z.y * sy),
-        w: Math.round(z.w * sx),
-        h: Math.round(z.h * sy),
-      }));
-
-      
-      
-      const fd = new FormData();
-      fd.append("template", templateFile);
-      fd.append("csv", csvFile);
-      fd.append("zones", JSON.stringify(zonesNatural));
-      fd.append("mapping", JSON.stringify(mapping));
-
-      const res = await fetch("/api/generate", { method: "POST", body: fd });
-      if (!res.ok) {
-        const j = await res.json().catch(() => null);
-        throw new Error(j?.error || "Generate failed");
-      }
-
-      const blob = await res.blob();
+      const response = await callApi("/api/generate");
+      if (!response) return;
+      const blob = await response.blob();
       const url = URL.createObjectURL(blob);
-
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "labelforge.zip";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = "labelforge.zip";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
       URL.revokeObjectURL(url);
-    } catch (e: any) {
-      setErr(e?.message ?? "Something went wrong.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Generate failed.");
     } finally {
-      setBusy(false);
+      setLoading(null);
     }
   }
-
-  function sizeToNatural(w: number, h: number) {
-    if (!imgNatural || !imgDisplay) return { w, h };
-    const sx = imgNatural.w / imgDisplay.w;
-    const sy = imgNatural.h / imgDisplay.h;
-    return { w: Math.round(w * sx), h: Math.round(h * sy) };
-  }
-
-  function sizeToImg(w: number, h: number) {
-    if (!imgNatural || !imgDisplay) return { w, h };
-    const sx = imgDisplay.w / imgNatural.w;
-    const sy = imgDisplay.h / imgNatural.h;
-    return { w: w * sx, h: h * sy };
-  }
-
 
   return (
-    <main className="min-h-screen p-6">
-      <div className="mx-auto max-w-6xl space-y-6">
-        <header className="flex items-center justify-between">
-          <div>
-            <h1 className="text-2xl font-semibold">LabelForge (MVP)</h1>
-            <p className="text-sm text-neutral-600">
-              Upload template PNG + CSV → place zones → map columns → generate PNG ZIP
-            </p>
-          </div>
-          <div className="flex gap-2">
+    <main className="mx-auto flex min-h-screen max-w-6xl flex-col gap-4 p-6">
+      <h1 className="text-2xl font-semibold">LabelForge</h1>
+
+      {error && <p className="rounded border border-red-400 bg-red-50 p-3 text-sm text-red-700">{error}</p>}
+
+      <section className="grid gap-4 md:grid-cols-2">
+        <div className="space-y-3 rounded border p-4">
+          <h2 className="font-medium">Inputs</h2>
+          <label className="block text-sm">
+            Template PNG
+            <input
+              className="mt-1 block w-full text-sm"
+              type="file"
+              accept="image/png"
+              onChange={(event) => onTemplateChange(event.target.files?.[0] ?? null)}
+            />
+          </label>
+
+          <label className="block text-sm">
+            CSV
+            <input
+              className="mt-1 block w-full text-sm"
+              type="file"
+              accept=".csv,text/csv"
+              onChange={(event) => {
+                void onCsvChange(event.target.files?.[0] ?? null);
+              }}
+            />
+          </label>
+
+          <div className="flex flex-wrap gap-2">
+            <button className="rounded border px-3 py-2 text-sm" onClick={addZone} type="button">
+              Add Zone
+            </button>
             <button
-              onClick={generateZip}
-              disabled={busy}
-              className="rounded-xl bg-black px-4 py-2 text-white disabled:opacity-50"
+              className="rounded bg-black px-3 py-2 text-sm text-white disabled:opacity-50"
+              onClick={() => {
+                void previewFirstRow();
+              }}
+              type="button"
+              disabled={loading !== null}
             >
-              {busy ? "Generating..." : "Generate ZIP"}
+              {loading === "preview" ? "Previewing..." : "Preview Row 1"}
+            </button>
+            <button
+              className="rounded bg-black px-3 py-2 text-sm text-white disabled:opacity-50"
+              onClick={() => {
+                void generateZip();
+              }}
+              type="button"
+              disabled={loading !== null}
+            >
+              {loading === "generate" ? "Generating..." : "Generate ZIP"}
+            </button>
+            <button className="rounded border px-3 py-2 text-sm" onClick={resetAll} type="button">
+              Reset
             </button>
           </div>
-        </header>
+        </div>
 
-        {err && (
-          <div className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-            {err}
+        <div className="space-y-3 rounded border p-4">
+          <h2 className="font-medium">CSV Preview</h2>
+          <p className="text-xs text-neutral-600">Headers: {headers.length > 0 ? headers.join(", ") : "(none)"}</p>
+          <div className="overflow-auto">
+            <table className="w-full border-collapse text-xs">
+              <thead>
+                <tr>
+                  {headers.map((header) => (
+                    <th key={header} className="border px-2 py-1 text-left font-medium">
+                      {header}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {previewRows.map((row, index) => (
+                  <tr key={index}>
+                    {headers.map((header) => (
+                      <td key={`${index}-${header}`} className="border px-2 py-1">
+                        {row[header]}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section className="space-y-3 rounded border p-4">
+        <h2 className="font-medium">Template + Zones</h2>
+        {!templateUrl ? (
+          <p className="text-sm text-neutral-500">Upload a PNG template to place zones.</p>
+        ) : (
+          <div className="relative inline-block max-w-full border">
+            <img src={templateUrl} alt="Template" className="block max-w-full" />
+            <div className="pointer-events-none absolute inset-0">
+              {zones.map((zone) => (
+                <Rnd
+                  key={zone.id}
+                  bounds="parent"
+                  size={{ width: zone.w, height: zone.h }}
+                  position={{ x: zone.x, y: zone.y }}
+                  onDragStop={(_, data) => updateZone(zone.id, { x: data.x, y: data.y })}
+                  onResizeStop={(_, __, ref, ___, pos) => {
+                    updateZone(zone.id, {
+                      x: pos.x,
+                      y: pos.y,
+                      w: ref.offsetWidth,
+                      h: ref.offsetHeight,
+                    });
+                  }}
+                  style={{ border: "2px dashed #2563eb", background: "rgba(37,99,235,0.08)", pointerEvents: "auto" }}
+                >
+                  <div className="flex h-full w-full items-center justify-center text-xs font-medium text-blue-800">{zone.name}</div>
+                </Rnd>
+              ))}
+            </div>
           </div>
         )}
+      </section>
 
-        <section className="grid gap-6 lg:grid-cols-[1.4fr_0.6fr]">
-          {/* Left: Template + Zones */}
-          <div className="rounded-2xl border bg-white p-4 shadow-sm">
-            <div className="flex flex-wrap items-center gap-3">
-              <label className="text-sm font-medium">Template PNG:</label>
+      <section className="space-y-2 rounded border p-4">
+        <h2 className="font-medium">Zone Mapping</h2>
+        <div className="space-y-2">
+          {zones.map((zone, index) => (
+            <div key={zone.id} className="grid gap-2 rounded border p-2 md:grid-cols-[1fr_auto_auto_auto_auto]">
               <input
-                type="file"
-                accept="image/png"
-                onChange={(e) => onTemplatePicked(e.target.files?.[0] ?? null)}
+                value={zone.name}
+                onChange={(event) => updateZone(zone.id, { name: event.target.value })}
+                className="rounded border px-2 py-1 text-sm"
               />
-              <button
-                onClick={addZone}
-                className="rounded-xl border px-3 py-1.5 text-sm hover:bg-neutral-50"
+              <input
+                type="number"
+                value={zone.fontSize}
+                onChange={(event) => updateZone(zone.id, { fontSize: Number(event.target.value) || 16 })}
+                className="w-full rounded border px-2 py-1 text-sm"
+                title="Font size"
+              />
+              <select
+                value={zone.align}
+                onChange={(event) => updateZone(zone.id, { align: event.target.value as Zone["align"] })}
+                className="rounded border px-2 py-1 text-sm"
               >
-                + Add Zone
-              </button>
-              <button
-                onClick={removeActiveZone}
-                disabled={!activeZoneId}
-                className="rounded-xl border px-3 py-1.5 text-sm hover:bg-neutral-50 disabled:opacity-50"
+                <option value="left">Left</option>
+                <option value="center">Center</option>
+                <option value="right">Right</option>
+              </select>
+              <select
+                value={mapping[zone.id] ?? ""}
+                onChange={(event) => setMapping((prev) => ({ ...prev, [zone.id]: event.target.value }))}
+                className="rounded border px-2 py-1 text-sm"
               >
-                Remove Zone
+                <option value="">Select column</option>
+                {headers.map((header) => (
+                  <option key={header} value={header}>
+                    {header}
+                  </option>
+                ))}
+              </select>
+              <button className="rounded border px-2 py-1 text-sm" onClick={() => removeZone(zone.id)} type="button">
+                Remove
               </button>
+              <input
+                type="color"
+                value={zone.color}
+                onChange={(event) => updateZone(zone.id, { color: event.target.value })}
+                className="h-9 w-12 rounded border"
+                title="Text color"
+              />
+              <div className="text-xs text-neutral-500 md:col-span-5">Zone {index + 1}</div>
             </div>
+          ))}
+        </div>
+      </section>
 
-            <div className="mt-4">
-              {!templateUrl ? (
-                <div className="rounded-xl border border-dashed p-10 text-center text-sm text-neutral-600">
-                  Upload a PNG template to start.
-                </div>
-              ) : (
-                <div className="relative inline-block">
-                  <img
-                    ref={imgRef}
-                    src={templateUrl}
-                    alt="template"
-                    className="max-w-full rounded-xl border select-none"
-                    draggable={false}
-                    onLoad={() => {
-                      const img = imgRef.current!;
-                      const rect = img.getBoundingClientRect();
-                      setImgNatural({ w: img.naturalWidth, h: img.naturalHeight });
-                      setImgDisplay({ w: Math.round(rect.width), h: Math.round(rect.height) });
-                    }}
-                  />
-
-                  {imgDisplay && (
-                    <div
-                      className="absolute left-0 top-0"
-                      style={{ width: imgDisplay.w, height: imgDisplay.h }}
-                    >
-                      {zones.map((z) => {
-                        // IMPORTANT: for MVP store zones in DISPLAY COORDS directly
-                        // so no conversion here
-                        const isActive = z.id === activeZoneId;
-
-                        return (
-                          <Rnd
-                            key={z.id}
-                            size={{ width: z.w, height: z.h }}
-                            position={{ x: z.x, y: z.y }}
-                            bounds="parent"
-                            enableResizing
-                            onMouseDown={() => setActiveZoneId(z.id)}
-                            onDragStop={(e, d) => updateZone(z.id, { x: d.x, y: d.y })}
-                            onResizeStop={(e, dir, ref, delta, pos) => {
-                              updateZone(z.id, {
-                                x: pos.x,
-                                y: pos.y,
-                                w: ref.offsetWidth,
-                                h: ref.offsetHeight,
-                              });
-                            }}
-                            style={{
-                              border: isActive ? "2px solid #000" : "2px solid rgba(0,0,0,0.35)",
-                              background: isActive ? "rgba(0,0,0,0.05)" : "rgba(0,0,0,0.02)",
-                              borderRadius: 12,
-                            }}
-                          >
-                            {/* pointer-events-none so Rnd always gets the drag */}
-                            <div className="h-full w-full p-2 text-xs pointer-events-none">
-                              <div className="font-semibold">{z.name}</div>
-                              <div className="opacity-70">
-                                {mapping[z.id] ? `← ${mapping[z.id]}` : "unmapped"}
-                              </div>
-                            </div>
-                          </Rnd>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              )}
-
-            </div>
-          </div>
-
-          {/* Right: CSV + Mapping + Zone Settings */}
-          <div className="space-y-6">
-            <div className="rounded-2xl border bg-white p-4 shadow-sm">
-              <div className="flex items-center gap-3">
-                <label className="text-sm font-medium">CSV Upload:</label>
-                <input
-                  type="file"
-                  accept=".csv,text/csv"
-                  onChange={(e) => onCsvPicked(e.target.files?.[0] ?? null)}
-                />
-              </div>
-
-              {csvHeaders.length > 0 && (
-                <div className="mt-3 text-xs text-neutral-600">
-                  Detected columns:{" "}
-                  <span className="text-neutral-900">{csvHeaders.join(", ")}</span>
-                </div>
-              )}
-
-              {csvPreview.length > 0 && (
-                <div className="mt-3 overflow-auto rounded-xl border">
-                  <table className="min-w-full text-xs">
-                    <thead className="bg-neutral-50">
-                      <tr>
-                        {csvHeaders.slice(0, 6).map((h) => (
-                          <th key={h} className="px-2 py-2 text-left font-medium">
-                            {h}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {csvPreview.map((row, idx) => (
-                        <tr key={idx} className="border-t">
-                          {csvHeaders.slice(0, 6).map((h) => (
-                            <td key={h} className="px-2 py-2 align-top">
-                              {String(row[h] ?? "").slice(0, 60)}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-
-            <div className="rounded-2xl border bg-white p-4 shadow-sm">
-              <div className="text-sm font-semibold">Zone Settings</div>
-              {!activeZone ? (
-                <div className="mt-2 text-sm text-neutral-600">Select a zone.</div>
-              ) : (
-                <div className="mt-3 space-y-3 text-sm">
-                  <div>
-                    <label className="text-xs text-neutral-600">Name</label>
-                    <input
-                      className="mt-1 w-full rounded-xl border px-3 py-2"
-                      value={activeZone.name}
-                      onChange={(e) => updateZone(activeZone.id, { name: e.target.value })}
-                    />
-                  </div>
-
-                  <div>
-                    <label className="text-xs text-neutral-600">Map to CSV Column</label>
-                    <select
-                      className="mt-1 w-full rounded-xl border px-3 py-2"
-                      value={mapping[activeZone.id] ?? ""}
-                      onChange={(e) =>
-                        setMapping((m) => ({ ...m, [activeZone.id]: e.target.value }))
-                      }
-                      disabled={csvHeaders.length === 0}
-                    >
-                      <option value="">Select column…</option>
-                      {csvHeaders.map((h) => (
-                        <option key={h} value={h}>
-                          {h}
-                        </option>
-                      ))}
-                    </select>
-                    {csvHeaders.length === 0 && (
-                      <div className="mt-1 text-xs text-neutral-500">Upload CSV to map columns.</div>
-                    )}
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="text-xs text-neutral-600">Font Size</label>
-                      <input
-                        type="number"
-                        className="mt-1 w-full rounded-xl border px-3 py-2"
-                        value={activeZone.fontSize}
-                        onChange={(e) =>
-                          updateZone(activeZone.id, { fontSize: Number(e.target.value) })
-                        }
-                        min={8}
-                        max={120}
-                      />
-                    </div>
-
-                    <div>
-                      <label className="text-xs text-neutral-600">Text Align</label>
-                      <select
-                        className="mt-1 w-full rounded-xl border px-3 py-2"
-                        value={activeZone.align}
-                        onChange={(e) =>
-                          updateZone(activeZone.id, {
-                            align: e.target.value as Zone["align"],
-                          })
-                        }
-                      >
-                        <option value="left">Left</option>
-                        <option value="center">Center</option>
-                        <option value="right">Right</option>
-                      </select>
-                    </div>
-
-                    <div>
-                      <label className="text-xs text-neutral-600">Text Color</label>
-                      <input
-                        type="color"
-                        className="mt-1 h-10 w-full rounded-xl border px-3 py-2"
-                        value={activeZone.color}
-                        onChange={(e) =>
-                          updateZone(activeZone.id, { color: e.target.value })
-                        }
-                      />
-                    </div>
-
-                    <div>
-                      <label className="text-xs text-neutral-600">Padding</label>
-                      <input
-                        type="number"
-                        className="mt-1 w-full rounded-xl border px-3 py-2"
-                        value={activeZone.padding ?? 10}
-                        onChange={(e) =>
-                          updateZone(activeZone.id, { padding: Number(e.target.value) })
-                        }
-                        min={0}
-                        max={60}
-                      />
-                    </div>
-                  </div>
-
-                  <div className="flex items-center justify-between rounded-xl border p-3">
-                    <div>
-                      <div className="text-sm font-medium">Background box</div>
-                      <div className="text-xs text-neutral-600">
-                        Makes text readable over photos
-                      </div>
-                    </div>
-                    <input
-                      type="checkbox"
-                      checked={!!activeZone.bgEnabled}
-                      onChange={(e) =>
-                        updateZone(activeZone.id, { bgEnabled: e.target.checked })
-                      }
-                    />
-                  </div>
-
-                  {activeZone.bgEnabled && (
-                    <div>
-                      <label className="text-xs text-neutral-600">
-                        Background (CSS rgba)
-                      </label>
-                      <input
-                        className="mt-1 w-full rounded-xl border px-3 py-2"
-                        value={activeZone.bgColor ?? "rgba(255,255,255,0.85)"}
-                        onChange={(e) =>
-                          updateZone(activeZone.id, { bgColor: e.target.value })
-                        }
-                        placeholder='rgba(255,255,255,0.85)'
-                      />
-                    </div>
-                  )}
-
-                  <div className="pt-2">
-                    <div className="text-xs text-neutral-500">
-                      Tip: Drag/resize zones on the image. Mapping controls which CSV column
-                      fills each zone.
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <div className="rounded-2xl border bg-white p-4 text-xs text-neutral-600 shadow-sm">
-              MVP limit: 200 rows per run (we’ll expand in Phase 2).
-            </div>
-          </div>
+      {previewImageUrl && (
+        <section className="space-y-2 rounded border p-4">
+          <h2 className="font-medium">Preview Output</h2>
+          <img src={previewImageUrl} alt="Preview row 1" className="max-w-full border" />
         </section>
-      </div>
+      )}
     </main>
   );
 }
