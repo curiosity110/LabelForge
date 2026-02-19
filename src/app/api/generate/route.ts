@@ -1,4 +1,5 @@
 import { PassThrough } from "stream";
+import { inflateRawSync } from "node:zlib";
 import archiver from "archiver";
 import { NextResponse } from "next/server";
 import Papa from "papaparse";
@@ -9,6 +10,9 @@ export const runtime = "nodejs";
 const MAX_ROWS = 50;
 const MAX_TEMPLATE_SIZE_BYTES = 5 * 1024 * 1024;
 const MAX_CSV_SIZE_BYTES = 2 * 1024 * 1024;
+const MAX_IMAGES_ZIP_SIZE_BYTES = 50 * 1024 * 1024;
+
+const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg"]);
 
 type Zone = {
   id: string;
@@ -22,6 +26,13 @@ type Zone = {
 };
 
 type Mapping = Record<string, string>;
+
+type ZipEntry = {
+  fileName: string;
+  compressedSize: number;
+  compressionMethod: number;
+  localHeaderOffset: number;
+};
 
 function escapeXml(value: string): string {
   return value
@@ -79,13 +90,7 @@ function wrapAndClamp(text: string, zone: Zone, fontSize: number): string[] {
   return clipped;
 }
 
-function buildOverlaySvg(
-  width: number,
-  height: number,
-  zones: Zone[],
-  mapping: Mapping,
-  row: Record<string, string>
-): string {
+function buildOverlaySvg(width: number, height: number, zones: Zone[], mapping: Mapping, row: Record<string, string>): string {
   const blocks = zones
     .map((zone) => {
       const column = mapping[zone.id];
@@ -126,20 +131,131 @@ function streamToBuffer(stream: PassThrough): Promise<Buffer> {
   });
 }
 
+function getBaseName(filePath: string): string {
+  return filePath.split("/").pop() ?? filePath;
+}
+
+function readUint32(buffer: Buffer, offset: number): number {
+  return buffer.readUInt32LE(offset);
+}
+
+function readUint16(buffer: Buffer, offset: number): number {
+  return buffer.readUInt16LE(offset);
+}
+
+function parseZipEntries(buffer: Buffer): ZipEntry[] {
+  const eocdSignature = 0x06054b50;
+  const cdSignature = 0x02014b50;
+  let eocdOffset = -1;
+
+  for (let i = buffer.length - 22; i >= Math.max(0, buffer.length - 22 - 65535); i -= 1) {
+    if (readUint32(buffer, i) === eocdSignature) {
+      eocdOffset = i;
+      break;
+    }
+  }
+
+  if (eocdOffset === -1) {
+    throw new Error("Invalid ZIP: end of central directory not found.");
+  }
+
+  const centralDirectorySize = readUint32(buffer, eocdOffset + 12);
+  const centralDirectoryOffset = readUint32(buffer, eocdOffset + 16);
+  const entries: ZipEntry[] = [];
+
+  let offset = centralDirectoryOffset;
+  const end = centralDirectoryOffset + centralDirectorySize;
+
+  while (offset < end) {
+    if (readUint32(buffer, offset) !== cdSignature) {
+      throw new Error("Invalid ZIP: malformed central directory entry.");
+    }
+
+    const compressionMethod = readUint16(buffer, offset + 10);
+    const compressedSize = readUint32(buffer, offset + 20);
+    const fileNameLength = readUint16(buffer, offset + 28);
+    const extraLength = readUint16(buffer, offset + 30);
+    const commentLength = readUint16(buffer, offset + 32);
+    const localHeaderOffset = readUint32(buffer, offset + 42);
+    const fileName = buffer.toString("utf8", offset + 46, offset + 46 + fileNameLength);
+
+    entries.push({
+      fileName,
+      compressedSize,
+      compressionMethod,
+      localHeaderOffset,
+    });
+
+    offset += 46 + fileNameLength + extraLength + commentLength;
+  }
+
+  return entries;
+}
+
+function extractEntryBuffer(zipBuffer: Buffer, entry: ZipEntry): Buffer {
+  const localSignature = 0x04034b50;
+  if (readUint32(zipBuffer, entry.localHeaderOffset) !== localSignature) {
+    throw new Error(`Invalid ZIP: missing local header for ${entry.fileName}.`);
+  }
+
+  const fileNameLength = readUint16(zipBuffer, entry.localHeaderOffset + 26);
+  const extraLength = readUint16(zipBuffer, entry.localHeaderOffset + 28);
+  const dataStart = entry.localHeaderOffset + 30 + fileNameLength + extraLength;
+  const compressedData = zipBuffer.subarray(dataStart, dataStart + entry.compressedSize);
+
+  if (entry.compressionMethod === 0) {
+    return Buffer.from(compressedData);
+  }
+  if (entry.compressionMethod === 8) {
+    return inflateRawSync(compressedData);
+  }
+
+  throw new Error(`Unsupported ZIP compression method for ${entry.fileName}.`);
+}
+
+function parseImagesZip(zipBuffer: Buffer): Map<string, Buffer> {
+  const images = new Map<string, Buffer>();
+  const entries = parseZipEntries(zipBuffer);
+
+  for (const entry of entries) {
+    if (entry.fileName.endsWith("/")) continue;
+    const baseName = getBaseName(entry.fileName);
+    const ext = baseName.slice(baseName.lastIndexOf(".")).toLowerCase();
+    if (!IMAGE_EXTENSIONS.has(ext)) continue;
+    images.set(baseName, extractEntryBuffer(zipBuffer, entry));
+  }
+
+  if (images.size === 0) {
+    throw new Error("Images ZIP did not contain any .png/.jpg/.jpeg files.");
+  }
+
+  return images;
+}
+
 export async function POST(request: Request) {
   const form = await request.formData();
 
   const template = form.get("template");
   const csv = form.get("csv");
+  const imagesZip = form.get("imagesZip");
+  const imageColumnRaw = form.get("imageColumn");
   const zonesRaw = form.get("zones");
   const mappingRaw = form.get("mapping");
 
-  if (!(template instanceof File) || !(csv instanceof File) || typeof zonesRaw !== "string" || typeof mappingRaw !== "string") {
-    return NextResponse.json({ error: "Missing template, csv, zones, or mapping." }, { status: 400 });
+  if (!(csv instanceof File) || typeof zonesRaw !== "string" || typeof mappingRaw !== "string") {
+    return NextResponse.json({ error: "Missing csv, zones, or mapping." }, { status: 400 });
   }
 
-  if (template.size > MAX_TEMPLATE_SIZE_BYTES) {
+  if (!(template instanceof File) && !(imagesZip instanceof File)) {
+    return NextResponse.json({ error: "Upload template PNG or images ZIP." }, { status: 400 });
+  }
+
+  if (template instanceof File && template.size > MAX_TEMPLATE_SIZE_BYTES) {
     return NextResponse.json({ error: "Template exceeds 5MB limit." }, { status: 400 });
+  }
+
+  if (imagesZip instanceof File && imagesZip.size > MAX_IMAGES_ZIP_SIZE_BYTES) {
+    return NextResponse.json({ error: "Images ZIP exceeds 50MB limit." }, { status: 400 });
   }
 
   if (csv.size > MAX_CSV_SIZE_BYTES) {
@@ -148,6 +264,7 @@ export async function POST(request: Request) {
 
   const zones = JSON.parse(zonesRaw) as Zone[];
   const mapping = JSON.parse(mappingRaw) as Mapping;
+  const imageColumn = typeof imageColumnRaw === "string" && imageColumnRaw ? imageColumnRaw : "image_file";
 
   if (!Array.isArray(zones) || zones.length === 0) {
     return NextResponse.json({ error: "At least one zone is required." }, { status: 400 });
@@ -163,6 +280,14 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: parsed.errors[0]?.message ?? "CSV parse failed." }, { status: 400 });
   }
 
+  const headers = (parsed.meta.fields ?? []).filter(Boolean);
+  if (!headers.includes("image_file")) {
+    return NextResponse.json({ error: 'CSV must include a column named "image_file".' }, { status: 400 });
+  }
+  if (!headers.includes(imageColumn)) {
+    return NextResponse.json({ error: `Image filename column "${imageColumn}" does not exist in CSV.` }, { status: 400 });
+  }
+
   const rows = parsed.data.filter((row: Record<string, string>) => Object.keys(row).length > 0);
   if (rows.length === 0) {
     return NextResponse.json({ error: "CSV has no rows." }, { status: 400 });
@@ -172,11 +297,17 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: `CSV exceeds MAX_ROWS (${MAX_ROWS}).` }, { status: 400 });
   }
 
-  const templateBuffer = Buffer.from(await template.arrayBuffer());
-  const metadata = await sharp(templateBuffer).metadata();
+  let imageMap: Map<string, Buffer> | null = null;
+  if (imagesZip instanceof File) {
+    imageMap = parseImagesZip(Buffer.from(await imagesZip.arrayBuffer()));
+  }
 
-  if (!metadata.width || !metadata.height) {
-    return NextResponse.json({ error: "Template dimensions could not be read." }, { status: 400 });
+  let templateBuffer: Buffer | null = null;
+  if (!imageMap) {
+    if (!(template instanceof File)) {
+      return NextResponse.json({ error: "Template PNG is required when images ZIP is not provided." }, { status: 400 });
+    }
+    templateBuffer = Buffer.from(await template.arrayBuffer());
   }
 
   const zipStream = new PassThrough();
@@ -185,11 +316,33 @@ export async function POST(request: Request) {
 
   for (let index = 0; index < rows.length; index += 1) {
     const row = rows[index];
+
+    let backgroundBuffer: Buffer;
+    if (imageMap) {
+      const imageFileName = String(row[imageColumn] ?? "").trim();
+      if (!imageFileName) {
+        return NextResponse.json({ error: `Row ${index + 1} is missing image filename in column "${imageColumn}".` }, { status: 400 });
+      }
+      const fromZip = imageMap.get(getBaseName(imageFileName));
+      if (!fromZip) {
+        return NextResponse.json({ error: `Missing image "${imageFileName}" for row ${index + 1} in uploaded ZIP.` }, { status: 400 });
+      }
+      backgroundBuffer = fromZip;
+    } else {
+      backgroundBuffer = templateBuffer as Buffer;
+    }
+
+    const metadata = await sharp(backgroundBuffer).metadata();
+    if (!metadata.width || !metadata.height) {
+      return NextResponse.json({ error: `Image dimensions could not be read for row ${index + 1}.` }, { status: 400 });
+    }
+
     const svg = buildOverlaySvg(metadata.width, metadata.height, zones, mapping, row);
-    const image = await sharp(templateBuffer)
+    const image = await sharp(backgroundBuffer)
       .composite([{ input: Buffer.from(svg), top: 0, left: 0 }])
       .png()
       .toBuffer();
+
     const name = String(index + 1).padStart(4, "0");
     archive.append(image, { name: `images/${name}.png` });
   }

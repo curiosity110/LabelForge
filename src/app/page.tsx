@@ -52,10 +52,12 @@ function snap(value: number, enabled: boolean) {
 export default function Page() {
   const [templateFile, setTemplateFile] = useState<File | null>(null);
   const [templateUrl, setTemplateUrl] = useState<string | null>(null);
+  const [imagesZipFile, setImagesZipFile] = useState<File | null>(null);
 
   const [csvFile, setCsvFile] = useState<File | null>(null);
   const [headers, setHeaders] = useState<string[]>([]);
   const [previewRows, setPreviewRows] = useState<CsvRow[]>([]);
+  const [imageColumn, setImageColumn] = useState("image_file");
 
   const [zones, setZones] = useState<Zone[]>([newZone(0)]);
   const [mapping, setMapping] = useState<Record<string, string>>({});
@@ -68,9 +70,9 @@ export default function Page() {
   const [error, setError] = useState<string | null>(null);
 
   const readyForRender = useMemo(() => {
-    if (!templateFile || !csvFile || zones.length === 0) return false;
+    if ((!templateFile && !imagesZipFile) || !csvFile || zones.length === 0) return false;
     return zones.every((zone) => Boolean(mapping[zone.id]));
-  }, [templateFile, csvFile, zones, mapping]);
+  }, [templateFile, imagesZipFile, csvFile, zones, mapping]);
 
   function resetAll() {
     if (templateUrl) URL.revokeObjectURL(templateUrl);
@@ -79,8 +81,10 @@ export default function Page() {
     setTemplateFile(null);
     setTemplateUrl(null);
     setCsvFile(null);
+    setImagesZipFile(null);
     setHeaders([]);
     setPreviewRows([]);
+    setImageColumn("image_file");
     setZones([newZone(0)]);
     setMapping({});
     setSelectedZoneId(null);
@@ -117,7 +121,13 @@ export default function Page() {
     }
 
     const csvHeaders = (parsed.meta.fields ?? []).filter(Boolean);
+    if (!csvHeaders.includes("image_file")) {
+      setError('CSV must include a column named "image_file".');
+      return;
+    }
+
     setHeaders(csvHeaders);
+    setImageColumn((current) => (csvHeaders.includes(current) ? current : "image_file"));
     setPreviewRows(parsed.data.slice(0, 5));
 
     setMapping((current) => {
@@ -233,14 +243,20 @@ export default function Page() {
   }
 
   async function callApi(path: "/api/preview" | "/api/generate") {
-    if (!templateFile || !csvFile) {
-      setError("Please upload both template PNG and CSV.");
+    if (!csvFile || (!templateFile && !imagesZipFile)) {
+      setError("Please upload CSV and either template PNG or images ZIP.");
       return;
     }
 
     const form = new FormData();
-    form.append("template", templateFile);
+    if (templateFile) {
+      form.append("template", templateFile);
+    }
+    if (imagesZipFile) {
+      form.append("imagesZip", imagesZipFile);
+    }
     form.append("csv", csvFile);
+    form.append("imageColumn", imageColumn);
     form.append("zones", JSON.stringify(zones));
     form.append("mapping", JSON.stringify(mapping));
 
@@ -334,6 +350,32 @@ export default function Page() {
                 void onCsvChange(event.target.files?.[0] ?? null);
               }}
             />
+          </label>
+
+          <label className="block text-sm">
+            Images ZIP
+            <input
+              className="mt-1 block w-full text-sm"
+              type="file"
+              accept=".zip,application/zip"
+              onChange={(event) => setImagesZipFile(event.target.files?.[0] ?? null)}
+            />
+          </label>
+
+          <label className="block text-sm">
+            Image filename column
+            <select
+              value={imageColumn}
+              onChange={(event) => setImageColumn(event.target.value)}
+              className="mt-1 block w-full rounded border px-2 py-1 text-sm"
+            >
+              <option value="image_file">image_file</option>
+              {headers.map((header) => (
+                <option key={header} value={header}>
+                  {header}
+                </option>
+              ))}
+            </select>
           </label>
 
           <div className="flex flex-wrap gap-2">
