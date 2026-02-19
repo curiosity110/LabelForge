@@ -27,6 +27,15 @@ type Mapping = Record<string, string>;
 type SourceMode = "template" | "zip";
 type ZipAssignMode = "filename" | "rowOrder";
 
+
+function parseJson<T>(value: string, name: string): T {
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    throw new Error(`Invalid ${name} payload.`);
+  }
+}
+
 function escapeXml(value: string): string {
   return value
     .replace(/&/g, "&amp;")
@@ -155,8 +164,14 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "CSV exceeds 2MB limit." }, { status: 400 });
   }
 
-  const zones = JSON.parse(zonesRaw) as Zone[];
-  const mapping = JSON.parse(mappingRaw) as Mapping;
+  let zones: Zone[];
+  let mapping: Mapping;
+  try {
+    zones = parseJson<Zone[]>(zonesRaw, "zones");
+    mapping = parseJson<Mapping>(mappingRaw, "mapping");
+  } catch (error) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : "Invalid request payload." }, { status: 400 });
+  }
   const imageColumn = typeof imageColumnRaw === "string" && imageColumnRaw ? imageColumnRaw : "image_file";
 
   if (!Array.isArray(zones) || zones.length === 0) {
@@ -200,7 +215,14 @@ export async function POST(request: Request) {
     if (!(imagesZip instanceof File)) {
       return NextResponse.json({ error: "Images ZIP is required in Images ZIP mode." }, { status: 400 });
     }
-    imageMap = await parseImagesZip(Buffer.from(await imagesZip.arrayBuffer()));
+    try {
+      imageMap = await parseImagesZip(Buffer.from(await imagesZip.arrayBuffer()));
+    } catch (error) {
+      return NextResponse.json(
+        { error: error instanceof Error ? error.message : "Failed to read images ZIP." },
+        { status: 400 },
+      );
+    }
 
     if (zipAssignMode === "rowOrder") {
       sortedZipNames = [...imageMap.keys()].sort((a, b) => a.localeCompare(b));
