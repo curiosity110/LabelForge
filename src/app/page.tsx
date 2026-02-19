@@ -104,9 +104,10 @@ export default function Page() {
   function zoneText(zone: Zone): string {
     const mappedColumn = mapping[zone.id];
     if (showRow1Values && rowOne && mappedColumn) {
-      return String(rowOne[mappedColumn] ?? "");
+      const rowValue = String(rowOne[mappedColumn] ?? "").trim();
+      if (rowValue) return rowValue;
     }
-    return mappedColumn ? `{{${zone.name || mappedColumn}}}` : "{{unmapped}}";
+    return `{{${zone.name || mappedColumn || "zone"}}}`;
   }
 
   function resetAll() {
@@ -631,7 +632,7 @@ export default function Page() {
                       {zone.name}
                     </div>
                     <div
-                      className="mt-1 rounded px-2 py-1 text-xs leading-snug text-neutral-900"
+                      className="mt-1 rounded px-2 py-1 text-xs font-medium leading-snug text-neutral-800"
                       style={{
                         background: zone.editorBgEnabled ? toRgba(zone.editorBgColor, zone.editorBgOpacity) : "transparent",
                         display: "-webkit-box",
