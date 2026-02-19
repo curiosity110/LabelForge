@@ -22,6 +22,8 @@ type Zone = {
 };
 
 type Mapping = Record<string, string>;
+type SourceMode = "template" | "zip";
+type ZipAssignMode = "filename" | "rowOrder";
 
 function escapeXml(value: string): string {
   return value
@@ -117,6 +119,8 @@ export async function POST(request: Request) {
   const template = form.get("template");
   const csv = form.get("csv");
   const imagesZip = form.get("imagesZip");
+  const sourceModeRaw = form.get("sourceMode");
+  const zipAssignModeRaw = form.get("zipAssignMode");
   const imageColumnRaw = form.get("imageColumn");
   const zonesRaw = form.get("zones");
   const mappingRaw = form.get("mapping");
@@ -125,9 +129,8 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Missing csv, zones, or mapping." }, { status: 400 });
   }
 
-  if (!(template instanceof File) && !(imagesZip instanceof File)) {
-    return NextResponse.json({ error: "Upload template PNG or images ZIP." }, { status: 400 });
-  }
+  const sourceMode: SourceMode = sourceModeRaw === "zip" ? "zip" : "template";
+  const zipAssignMode: ZipAssignMode = zipAssignModeRaw === "rowOrder" ? "rowOrder" : "filename";
 
   if (template instanceof File && template.size > MAX_TEMPLATE_SIZE_BYTES) {
     return NextResponse.json({ error: "Template exceeds 5MB limit." }, { status: 400 });
@@ -160,10 +163,7 @@ export async function POST(request: Request) {
   }
 
   const headers = (parsed.meta.fields ?? []).filter(Boolean);
-  if (!headers.includes("image_file")) {
-    return NextResponse.json({ error: 'CSV must include a column named "image_file".' }, { status: 400 });
-  }
-  if (!headers.includes(imageColumn)) {
+  if (sourceMode === "zip" && zipAssignMode === "filename" && !headers.includes(imageColumn)) {
     return NextResponse.json({ error: `Image filename column "${imageColumn}" does not exist in CSV.` }, { status: 400 });
   }
 
@@ -179,22 +179,39 @@ export async function POST(request: Request) {
   const firstRow = rows[0];
   let backgroundBuffer: Buffer;
 
-  if (imagesZip instanceof File) {
-    const imageMap = await parseImagesZip(Buffer.from(await imagesZip.arrayBuffer()));
-    const imageFileName = String(firstRow[imageColumn] ?? "").trim();
-    if (!imageFileName) {
-      return NextResponse.json({ error: `Row 1 is missing image filename in column "${imageColumn}".` }, { status: 400 });
+  if (sourceMode === "template") {
+    if (!(template instanceof File)) {
+      return NextResponse.json({ error: "Template PNG is required in Template PNG mode." }, { status: 400 });
     }
-
-    const imageFromZip = imageMap.get(normalizeImageFileName(imageFileName));
-    if (!imageFromZip) {
-      return NextResponse.json({ error: `Missing image "${imageFileName}" in uploaded ZIP.` }, { status: 400 });
-    }
-    backgroundBuffer = imageFromZip;
-  } else if (template instanceof File) {
     backgroundBuffer = Buffer.from(await template.arrayBuffer());
   } else {
-    return NextResponse.json({ error: "Upload template PNG or images ZIP." }, { status: 400 });
+    if (!(imagesZip instanceof File)) {
+      return NextResponse.json({ error: "Images ZIP is required in Images ZIP mode." }, { status: 400 });
+    }
+
+    const imageMap = await parseImagesZip(Buffer.from(await imagesZip.arrayBuffer()));
+
+    if (zipAssignMode === "rowOrder") {
+      const sortedNames = [...imageMap.keys()].sort((a, b) => a.localeCompare(b));
+      const firstName = sortedNames[0];
+      const firstImage = firstName ? imageMap.get(firstName) : null;
+      if (!firstImage) {
+        return NextResponse.json({ error: "Images ZIP did not contain any usable image files." }, { status: 400 });
+      }
+      backgroundBuffer = firstImage;
+    } else {
+      const imageFileName = String(firstRow[imageColumn] ?? "").trim();
+      if (!imageFileName) {
+        return NextResponse.json({ error: `Row 1 is missing image filename in column "${imageColumn}".` }, { status: 400 });
+      }
+
+      const normalizedName = normalizeImageFileName(imageFileName);
+      const imageFromZip = imageMap.get(normalizedName);
+      if (!imageFromZip) {
+        return NextResponse.json({ error: `Missing image "${imageFileName}" in uploaded ZIP.` }, { status: 400 });
+      }
+      backgroundBuffer = imageFromZip;
+    }
   }
 
   const metadata = await sharp(backgroundBuffer).metadata();
